@@ -10,8 +10,18 @@
 #include <arpa/inet.h>
 #include <signal.h>
 
+/* Constants */
+#define MAX_MSG_LEN 64
+
+struct msg {
+    char *content;
+    time_t ts;
+    struct msg *next;
+};
+
 /* Global variables */
 int listenfd;
+struct msg *msgHead = NULL;
 
 /* for cleanup purposes while this is still work in progress */
 void handleSig (int sig) {
@@ -66,11 +76,87 @@ ssize_t readn (int fd, void *vptr, size_t n) {
     return n - nleft;
 }
 
+/* read a line from a given file descriptor */
+ssize_t readline (int fd, void *vptr, size_t maxlen) {
+    ssize_t n, rc;
+    char c, *ptr = vptr;
+
+    for (n = 1; n < maxlen; n++) {
+        again:
+            if ((rc = read(fd, &c, 1)) == 1) {
+                *ptr++ = c;
+                if (c == '\n') {
+                    break;
+                }
+            } else if (rc == 0) {
+                /* EOF */
+                *ptr = 0;
+                return n - 1;
+            } else {
+                if (errno == EINTR) {
+                    goto again;
+                }
+                return -1;
+            }
+    }
+
+    *ptr = 0;
+    return n;
+}
+
+/* add a new message */
+void addmsg (char *buf) {
+    if (msgHead == NULL) {
+        struct msg *newmsg = (struct msg *) malloc(sizeof(struct msg));
+
+        /* fill info for newmsg */
+        newmsg -> content = (char *) malloc((strlen(buf) + 1) * sizeof(char));
+        memcpy(newmsg -> content, buf, strlen(buf) + 1);
+        newmsg -> ts = time(NULL);
+        newmsg -> next = NULL;
+
+        /* update head */
+        msgHead = newmsg;
+    } else {
+        struct msg *curmsg = msgHead;
+        while (curmsg -> next != NULL) {
+            curmsg = curmsg -> next;
+        }
+        struct msg *newmsg = (struct msg *) malloc(sizeof(struct msg));
+
+        /* fill info for newmsg */
+        newmsg -> content = (char *) malloc((strlen(buf) + 1) * sizeof(char));
+        memcpy(newmsg -> content, buf, strlen(buf) + 1);
+        newmsg -> ts = time(NULL);
+        newmsg -> next = NULL;
+
+        /* update link */
+        curmsg -> next = newmsg;
+    }
+}
+
+/* list all messages */
+void listmsg (int fd) {
+    struct msg *curmsg = msgHead;
+
+    while (curmsg != NULL) {
+        writen(fd, curmsg -> content, strlen(curmsg -> content));
+        char msgtime[32];
+        ctime_r(&(curmsg -> ts), msgtime);
+        writen(fd, "@ ", 2 * sizeof(char));
+        writen(fd, msgtime, sizeof(msgtime));
+        writen(fd, "\n\n", 2 * sizeof(char));
+
+        curmsg = curmsg -> next;
+    }
+}
+
 /* output available options to a given file descriptor */
 int printOptions (int fd) {
     char list[] = "[1] Compose message. \n"
                   "[2] Read message. \n"
-                  "[3] Delete message. \n";
+                  "[3] Delete message. \n"
+                  "[4] EXIT. \n";
 
     if (writen(fd, list, sizeof(list)) < sizeof(list)) {
         return -1;
@@ -81,17 +167,14 @@ int printOptions (int fd) {
 
 /* get user's choice */
 int getOption (int fd) {
-    char response[2];
+    char response[8];
+    ssize_t ok;
 
-    if (readn(fd, response, sizeof(response)) != sizeof(response)) {
-        return -1;
-    }
+    do {
+        ok = readline(fd, response, 8);
+    } while (response[0] < '0' || response[0] > '9' || ok == -1);
 
-    if (response[0] >= '0' && response[0] <= '9') {
-        return response[0] - '0';
-    } else {
-        return -2;
-    }
+    return response[0] - '0';
 }
 
 /* main function for each thread */
@@ -99,7 +182,7 @@ void* threadMain (void *arg) {
     int connfd = *((int *) arg);
     free(arg);
 
-    int ok = 0, option;
+    int option = 0;
     do {
         if (printOptions(connfd) != 0) {
             printf("printOptions() failure!\n");
@@ -107,15 +190,18 @@ void* threadMain (void *arg) {
         }
 
         option = getOption(connfd);
-        if (option >= 0 && option <= 9) {
-            ok = 1;
-        }
-    } while (!ok);
 
-    char ans[32];
-    bzero(ans, sizeof(ans));
-    snprintf(ans, sizeof(ans), "You chose option #%d\n", option);
-    writen(connfd, ans, sizeof(ans));
+        if (option == 1) {
+            /* compose message */
+            char ans[MAX_MSG_LEN];
+            bzero(ans, sizeof(ans));
+            readline(connfd, ans, MAX_MSG_LEN);
+
+            addmsg(ans);
+        } else if (option == 2) {
+            listmsg(connfd);
+        }
+    } while (option != 4);
 
     /* cleanup and exit */
     pthread_detach(pthread_self());
