@@ -9,24 +9,30 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <jmorecfg.h>
 
 /* Constants */
-#define MAX_MSG_LEN 64
+#define MAX_MSG_LEN 64      /* maximum length of a message */
+#define MAX_PREVIEW_LEN 16  /* maximum length of a message when listing */
 
 struct msg {
-    char *content;
-    time_t ts;
-    struct msg *next;
+    char *content;          /* message text */
+    time_t ts;              /* message timestamp */
+    int id;                 /* message id */
+    pthread_rwlock_t lock;  /* lock in case of read/edit */
+    struct msg *next;       /* pointer to next message */
 };
 
 /* Global variables */
-int listenfd;
+int listenfd, ids = 1;
 struct msg *msgHead = NULL;
+pthread_mutex_t listLock;
 
 /* for cleanup purposes while this is still work in progress */
 void handleSig (int sig) {
     printf(">>> cleanup & exit process started...\n");
     close(listenfd);
+    pthread_mutex_destroy(&listLock);
     exit(0);
 }
 
@@ -76,17 +82,18 @@ ssize_t readn (int fd, void *vptr, size_t n) {
     return n - nleft;
 }
 
-/* read a line from a given file descriptor */
-ssize_t readline (int fd, void *vptr, size_t maxlen) {
+/* read from a given file descriptor, until end character */
+ssize_t readline (int fd, void *vptr, size_t maxlen, char end) {
     ssize_t n, rc;
     char c, *ptr = vptr;
 
     for (n = 1; n < maxlen; n++) {
         again:
             if ((rc = read(fd, &c, 1)) == 1) {
-                *ptr++ = c;
-                if (c == '\n') {
+                if (c == end) {
                     break;
+                } else {
+                    *ptr++ = c;
                 }
             } else if (rc == 0) {
                 /* EOF */
@@ -106,6 +113,7 @@ ssize_t readline (int fd, void *vptr, size_t maxlen) {
 
 /* add a new message */
 void addmsg (char *buf) {
+    pthread_mutex_lock(&listLock);
     if (msgHead == NULL) {
         struct msg *newmsg = (struct msg *) malloc(sizeof(struct msg));
 
@@ -114,6 +122,8 @@ void addmsg (char *buf) {
         memcpy(newmsg -> content, buf, strlen(buf) + 1);
         newmsg -> ts = time(NULL);
         newmsg -> next = NULL;
+        newmsg -> id = ids++;
+        pthread_rwlock_init(&newmsg -> lock, NULL);
 
         /* update head */
         msgHead = newmsg;
@@ -129,34 +139,95 @@ void addmsg (char *buf) {
         memcpy(newmsg -> content, buf, strlen(buf) + 1);
         newmsg -> ts = time(NULL);
         newmsg -> next = NULL;
+        newmsg -> id = ids++;
+        pthread_rwlock_init(&newmsg -> lock, NULL);
 
         /* update link */
         curmsg -> next = newmsg;
     }
+    pthread_mutex_unlock(&listLock);
 }
 
 /* list all messages */
 void listmsg (int fd) {
+    pthread_mutex_lock(&listLock);
     struct msg *curmsg = msgHead;
 
     while (curmsg != NULL) {
-        writen(fd, curmsg -> content, strlen(curmsg -> content));
+        writen(fd, curmsg -> content, MAX_PREVIEW_LEN);
+        writen(fd, "\n...\n", 5 * sizeof(char));
+
         char msgtime[32];
         ctime_r(&(curmsg -> ts), msgtime);
+        msgtime[strlen(msgtime) - 1] = 0;
+
+        char sid[sizeof(int)];
+        snprintf(sid, sizeof(int), "%d", curmsg -> id);
+
         writen(fd, "@ ", 2 * sizeof(char));
         writen(fd, msgtime, sizeof(msgtime));
-        writen(fd, "\n\n", 2 * sizeof(char));
+        writen(fd, "\t ID:", 5 * sizeof(char));
+        writen(fd, sid, sizeof(int));
+        writen(fd, "\n", sizeof(char));
 
         curmsg = curmsg -> next;
     }
+
+    pthread_mutex_unlock(&listLock);
+}
+
+/* given an ID of a message, return its address */
+struct msg * findmsg (int msgid) {
+    pthread_mutex_lock(&listLock);
+    struct msg *curmsg = msgHead;
+    while (curmsg != NULL) {
+        if (curmsg -> id == msgid) {
+            pthread_mutex_unlock(&listLock);
+            return curmsg;
+        }
+        curmsg = curmsg -> next;
+    }
+    pthread_mutex_unlock(&listLock);
+
+    return NULL;
+}
+
+/* print entire message */
+int printmsg (int fd, int msgid) {
+    struct msg *m = findmsg(msgid);
+
+    if (m == NULL) {
+        return -1;
+    }
+
+    pthread_rwlock_rdlock(&m -> lock);
+    writen(fd, m -> content, strlen(m -> content));
+    char msgtime[32];
+    ctime_r(&(m -> ts), msgtime);
+    msgtime[strlen(msgtime) - 1] = 0;
+
+    char sid[sizeof(int)];
+    snprintf(sid, sizeof(int), "%d", m -> id);
+
+    writen(fd, "\n", sizeof(char));
+    writen(fd, "@ ", 2 * sizeof(char));
+    writen(fd, msgtime, sizeof(msgtime));
+    writen(fd, "\t ID:", 5 * sizeof(char));
+    writen(fd, sid, sizeof(int));
+    writen(fd, "\n", sizeof(char));
+    pthread_rwlock_unlock(&m -> lock);
+
+    return 0;
 }
 
 /* output available options to a given file descriptor */
 int printOptions (int fd) {
     char list[] = "[1] Compose message. \n"
-                  "[2] Read message. \n"
-                  "[3] Delete message. \n"
-                  "[4] EXIT. \n";
+                  "[2] List messages. \n"
+                  "[3] Read message. \n"
+                  "[4] Edit message. \n"
+                  "[5] Delete message. \n"
+                  "[6] EXIT. \n";
 
     if (writen(fd, list, sizeof(list)) < sizeof(list)) {
         return -1;
@@ -168,13 +239,15 @@ int printOptions (int fd) {
 /* get user's choice */
 int getOption (int fd) {
     char response[8];
+    int ans;
     ssize_t ok;
 
     do {
-        ok = readline(fd, response, 8);
-    } while (response[0] < '0' || response[0] > '9' || ok == -1);
+        ok = readline(fd, response, 8, '\n');
+        ans = atoi(response);
+    } while (ans == 0 || ok == -1);
 
-    return response[0] - '0';
+    return ans;
 }
 
 /* main function for each thread */
@@ -195,13 +268,20 @@ void* threadMain (void *arg) {
             /* compose message */
             char ans[MAX_MSG_LEN];
             bzero(ans, sizeof(ans));
-            readline(connfd, ans, MAX_MSG_LEN);
+            readline(connfd, ans, MAX_MSG_LEN, ']');
 
             addmsg(ans);
         } else if (option == 2) {
             listmsg(connfd);
+        } else if (option == 3) {
+            int msgid = getOption(connfd);
+
+            if (printmsg(connfd, msgid) != 0) {
+                char err[] = "Incorrect ID! Use [2] to list messages.\n";
+                writen(connfd, err, sizeof(err));
+            }
         }
-    } while (option != 4);
+    } while (option != 6);
 
     /* cleanup and exit */
     pthread_detach(pthread_self());
@@ -210,11 +290,14 @@ void* threadMain (void *arg) {
 }
 
 int main() {
+    /* close socket when shutting down the server */
     signal(SIGTERM, handleSig);
+    signal(SIGINT, handleSig);
 
     int *connptr;
     struct sockaddr_in servaddr;
     pthread_t tids[16];
+    pthread_mutex_init(&listLock, NULL);
 
     listenfd = socket(AF_INET, SOCK_STREAM, 0);
     if (listenfd == -1) {
