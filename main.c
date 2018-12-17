@@ -9,7 +9,6 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
-#include <jmorecfg.h>
 
 /* Constants */
 #define MAX_MSG_LEN 64      /* maximum length of a message */
