@@ -9,28 +9,39 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <openssl/conf.h>
+#include <openssl/evp.h>
+#include <openssl/err.h>
 
 /* Constants */
 #define MAX_MSG_LEN 64      /* maximum length of a message */
 #define MAX_PREVIEW_LEN 16  /* maximum length of a message when listing */
 
+/* Message structure */
 struct msg {
     char *content;          /* message text */
     time_t ts;              /* message timestamp */
-    int id;                 /* message id */
+    unsigned long id;       /* message id */
     pthread_rwlock_t lock;  /* lock in case of read/edit */
     struct msg *next;       /* pointer to next message */
 };
 
 /* Global variables */
-int listenfd, ids = 1;
+int g_listenfd;
+unsigned long ids = 1;
 struct msg *msgHead = NULL;
 pthread_mutex_t listLock;
+
+/* A 256 bit key */
+unsigned char *key = (unsigned char *)"password";
+
+/* A 128 bit IV */
+unsigned char *iv = (unsigned char *)"samepassword";
 
 /* for cleanup purposes while this is still work in progress */
 void handleSig (int sig) {
     printf(">>> cleanup & exit process started...\n");
-    close(listenfd);
+    close(g_listenfd);
     pthread_mutex_destroy(&listLock);
     exit(0);
 }
@@ -110,8 +121,59 @@ ssize_t readline (int fd, void *vptr, size_t maxlen, char end) {
     return n;
 }
 
+int encrypt(unsigned char *plaintext, int plaintext_len, unsigned char *key,
+            unsigned char *iv, unsigned char *ciphertext) {
+    EVP_CIPHER_CTX *ctx;
+    int len;
+    int ciphertext_len;
+
+    if(!(ctx = EVP_CIPHER_CTX_new())) {
+        return -1;
+    }
+
+    if(1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv))
+        return -1;
+
+    if(1 != EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, plaintext_len))
+        return -1;
+    ciphertext_len = len;
+
+    if(1 != EVP_EncryptFinal_ex(ctx, ciphertext + len, &len))
+        return -1;
+    ciphertext_len += len;
+
+    EVP_CIPHER_CTX_free(ctx);
+
+    return ciphertext_len;
+}
+
+int decrypt(unsigned char *ciphertext, int ciphertext_len, unsigned char *key,
+            unsigned char *iv, unsigned char *plaintext) {
+    EVP_CIPHER_CTX *ctx;
+    int len;
+    int plaintext_len;
+
+    if(!(ctx = EVP_CIPHER_CTX_new()))
+        return -1;
+
+    if(1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv))
+        return -1;
+
+    if(1 != EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ciphertext_len))
+        return -1;
+    plaintext_len = len;
+
+    if(1 != EVP_DecryptFinal_ex(ctx, plaintext + len, &len))
+        return -1;
+    plaintext_len += len;
+
+    EVP_CIPHER_CTX_free(ctx);
+
+    return plaintext_len;
+}
+
 /* add a new message */
-void addmsg (char *buf) {
+void add_msg (char *buf) {
     pthread_mutex_lock(&listLock);
     if (msgHead == NULL) {
         struct msg *newmsg = (struct msg *) malloc(sizeof(struct msg));
@@ -147,8 +209,35 @@ void addmsg (char *buf) {
     pthread_mutex_unlock(&listLock);
 }
 
+int delete_msg (unsigned long msgid) {
+    pthread_mutex_lock(&listLock);
+    struct msg *cur = msgHead;
+
+    if (cur -> id == msgid) {
+        msgHead = cur -> next;
+        free(cur);
+        pthread_mutex_unlock(&listLock);
+        return 0;
+    }
+
+    while (cur -> next != NULL && cur -> next -> id != msgid) {
+        cur = cur -> next;
+    }
+
+    if (cur -> next == NULL) {
+        pthread_mutex_unlock(&listLock);
+        return -1;
+    } else {
+        struct msg *aux = cur -> next;
+        cur -> next = cur -> next -> next;
+        free(aux);
+        pthread_mutex_unlock(&listLock);
+        return 0;
+    }
+}
+
 /* list all messages */
-void listmsg (int fd) {
+void list_msg (int fd) {
     pthread_mutex_lock(&listLock);
     struct msg *curmsg = msgHead;
 
@@ -161,7 +250,7 @@ void listmsg (int fd) {
         msgtime[strlen(msgtime) - 1] = 0;
 
         char sid[sizeof(int)];
-        snprintf(sid, sizeof(int), "%d", curmsg -> id);
+        snprintf(sid, sizeof(unsigned long), "%lu", curmsg -> id);
 
         writen(fd, "@ ", 2 * sizeof(char));
         writen(fd, msgtime, sizeof(msgtime));
@@ -176,7 +265,7 @@ void listmsg (int fd) {
 }
 
 /* given an ID of a message, return its address */
-struct msg * findmsg (int msgid) {
+struct msg* find_msg (unsigned long msgid) {
     pthread_mutex_lock(&listLock);
     struct msg *curmsg = msgHead;
     while (curmsg != NULL) {
@@ -192,8 +281,8 @@ struct msg * findmsg (int msgid) {
 }
 
 /* print entire message */
-int printmsg (int fd, int msgid) {
-    struct msg *m = findmsg(msgid);
+int print_msg (int fd, unsigned long msgid) {
+    struct msg *m = find_msg(msgid);
 
     if (m == NULL) {
         return -1;
@@ -205,14 +294,14 @@ int printmsg (int fd, int msgid) {
     ctime_r(&(m -> ts), msgtime);
     msgtime[strlen(msgtime) - 1] = 0;
 
-    char sid[sizeof(int)];
-    snprintf(sid, sizeof(int), "%d", m -> id);
+    char sid[sizeof(unsigned long)];
+    snprintf(sid, sizeof(unsigned long), "%lu", m -> id);
 
     writen(fd, "\n", sizeof(char));
     writen(fd, "@ ", 2 * sizeof(char));
     writen(fd, msgtime, sizeof(msgtime));
     writen(fd, "\t ID:", 5 * sizeof(char));
-    writen(fd, sid, sizeof(int));
+    writen(fd, sid, sizeof(unsigned long));
     writen(fd, "\n", sizeof(char));
     pthread_rwlock_unlock(&m -> lock);
 
@@ -220,13 +309,12 @@ int printmsg (int fd, int msgid) {
 }
 
 /* output available options to a given file descriptor */
-int printOptions (int fd) {
+int print_options (int fd) {
     char list[] = "[1] Compose message. \n"
                   "[2] List messages. \n"
                   "[3] Read message. \n"
-                  "[4] Edit message. \n"
-                  "[5] Delete message. \n"
-                  "[6] EXIT. \n";
+                  "[4] Delete message. \n"
+                  "[5] EXIT. \n";
 
     if (writen(fd, list, sizeof(list)) < sizeof(list)) {
         return -1;
@@ -236,51 +324,57 @@ int printOptions (int fd) {
 }
 
 /* get user's choice */
-int getOption (int fd) {
+unsigned long get_option (int fd) {
     char response[8];
-    int ans;
+    unsigned long ans;
     ssize_t ok;
 
     do {
         ok = readline(fd, response, 8, '\n');
-        ans = atoi(response);
+        ans = strtoul(response, NULL, 10);
     } while (ans == 0 || ok == -1);
 
     return ans;
 }
 
 /* main function for each thread */
-void* threadMain (void *arg) {
+void* thread_func (void *arg) {
     int connfd = *((int *) arg);
     free(arg);
 
-    int option = 0;
+    unsigned long option = 0;
     do {
-        if (printOptions(connfd) != 0) {
-            printf("printOptions() failure!\n");
+        if (print_options(connfd) != 0) {
+            printf("print_options() failure!\n");
             continue;
         }
 
-        option = getOption(connfd);
+        option = get_option(connfd);
 
         if (option == 1) {
             /* compose message */
             char ans[MAX_MSG_LEN];
             bzero(ans, sizeof(ans));
             readline(connfd, ans, MAX_MSG_LEN, ']');
-
-            addmsg(ans);
+            add_msg(ans);
         } else if (option == 2) {
-            listmsg(connfd);
+            list_msg(connfd);
         } else if (option == 3) {
-            int msgid = getOption(connfd);
+            unsigned long msgid = get_option(connfd);
 
-            if (printmsg(connfd, msgid) != 0) {
-                char err[] = "Incorrect ID! Use [2] to list messages.\n";
+            if (print_msg(connfd, msgid) != 0) {
+                char err[] = "Incorrect message ID! Use [2] to list messages.\n";
+                writen(connfd, err, sizeof(err));
+            }
+        } else if (option == 4) {
+            unsigned long msgid = get_option(connfd);
+
+            if (delete_msg(msgid) != 0) {
+                char err[] = "Incorrect message ID! Use [2] to list messages.\n";
                 writen(connfd, err, sizeof(err));
             }
         }
-    } while (option != 6);
+    } while (option != 5);
 
     /* cleanup and exit */
     pthread_detach(pthread_self());
@@ -294,33 +388,31 @@ int main() {
     signal(SIGINT, handleSig);
 
     int *connptr;
-    struct sockaddr_in servaddr;
+    struct sockaddr_in servaddr, cliaddr;
+    socklen_t slen = sizeof(cliaddr);
     pthread_t tids[16];
     pthread_mutex_init(&listLock, NULL);
 
-    listenfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listenfd == -1) {
+    g_listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (g_listenfd == -1) {
         perror("socket creation failed");
         exit(0);
     }
 
     bzero(&servaddr, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
-    if (inet_aton("127.0.0.1", &servaddr.sin_addr) == 0) {
-        perror("IP address conversion failed");
-        exit(0);
-    }
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
     servaddr.sin_port = htons(60000);
 
-    if (bind(listenfd, (struct sockaddr*) &servaddr, sizeof(servaddr)) == -1) {
+    if (bind(g_listenfd, (struct sockaddr*) &servaddr, sizeof(servaddr)) == -1) {
         perror("bind failed");
-        close(listenfd);
+        close(g_listenfd);
         exit(0);
     }
 
-    if (listen(listenfd, 128) == -1) {
+    if (listen(g_listenfd, 128) == -1) {
         perror("listen failed");
-        close(listenfd);
+        close(g_listenfd);
         exit(0);
     }
 
@@ -329,9 +421,11 @@ int main() {
 
     for ( ; ; ) {
         connptr = (int *) malloc (sizeof(int));
-        *connptr = accept(listenfd, NULL, NULL);
+        *connptr = accept(g_listenfd, (struct sockaddr *) &cliaddr, &slen);
 
-        if (pthread_create(&tids[i++], NULL, &threadMain, connptr) != 0) {
+        printf("connection from %s, port %d\n", inet_ntoa(cliaddr.sin_addr), ntohs(cliaddr.sin_port));
+
+        if (pthread_create(&tids[i++], NULL, &thread_func, connptr) != 0) {
             perror("creating thread failure");
             close(*connptr);
         }
