@@ -19,7 +19,8 @@
 
 /* Message structure */
 struct msg {
-    char *content;          /* message text */
+    unsigned char *content; /* message text */
+    int len;                /* encryption length */
     time_t ts;              /* message timestamp */
     unsigned long id;       /* message id */
     pthread_rwlock_t lock;  /* lock in case of read/edit */
@@ -27,26 +28,22 @@ struct msg {
 };
 
 /* Global variables */
-int g_listenfd;
-unsigned long ids = 1;
-struct msg *msgHead = NULL;
-pthread_mutex_t listLock;
+int g_listenfd;             /* listen fd of the server */
+unsigned long ids = 1;      /* message ID counter */
+struct msg *msgHead = NULL; /* head to the list of messages */
+pthread_mutex_t listLock;   /* message list mutex */
+unsigned char *key;         /* A 256 bit key (used for encryption) */
+unsigned char *iv;          /* A 128 bit IV (used for encryption) */
 
-/* A 256 bit key */
-unsigned char *key = (unsigned char *)"password";
-
-/* A 128 bit IV */
-unsigned char *iv = (unsigned char *)"samepassword";
-
-/* for cleanup purposes while this is still work in progress */
+/* cleanup function in case of shutting down the server */
 void handleSig (int sig) {
-    printf(">>> cleanup & exit process started...\n");
+    printf("\nshutting down server...\n");
     close(g_listenfd);
     pthread_mutex_destroy(&listLock);
     exit(0);
 }
 
-/* write n bytes to a file descriptor */
+/* write n bytes to a given file descriptor */
 ssize_t writen (int fd, const void *vptr, size_t n) {
     size_t nleft = n;
     ssize_t nwritten;
@@ -67,7 +64,7 @@ ssize_t writen (int fd, const void *vptr, size_t n) {
     return n;
 }
 
-/* read n bytes from a file descriptor */
+/* read n bytes from a given file descriptor */
 ssize_t readn (int fd, void *vptr, size_t n) {
     size_t nleft = n;
     ssize_t nread;
@@ -92,7 +89,7 @@ ssize_t readn (int fd, void *vptr, size_t n) {
     return n - nleft;
 }
 
-/* read from a given file descriptor, until end character */
+/* read from a given file descriptor, until 'end' character is reached */
 ssize_t readline (int fd, void *vptr, size_t maxlen, char end) {
     ssize_t n, rc;
     char c, *ptr = vptr;
@@ -121,6 +118,11 @@ ssize_t readline (int fd, void *vptr, size_t maxlen, char end) {
     return n;
 }
 
+/*
+ *  The following two functions use aes-256 to encrypt/decrypt given strings.
+ *  For more information visit
+ *      https://wiki.openssl.org/index.php/EVP_Symmetric_Encryption_and_Decryption
+ */
 int encrypt(unsigned char *plaintext, int plaintext_len, unsigned char *key,
             unsigned char *iv, unsigned char *ciphertext) {
     EVP_CIPHER_CTX *ctx;
@@ -161,6 +163,7 @@ int decrypt(unsigned char *ciphertext, int ciphertext_len, unsigned char *key,
 
     if(1 != EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ciphertext_len))
         return -1;
+
     plaintext_len = len;
 
     if(1 != EVP_DecryptFinal_ex(ctx, plaintext + len, &len))
@@ -172,18 +175,28 @@ int decrypt(unsigned char *ciphertext, int ciphertext_len, unsigned char *key,
     return plaintext_len;
 }
 
-/* add a new message */
-void add_msg (char *buf) {
+int add_msg (unsigned char *buf) {
+    /* encrypt message */
+    unsigned char ciphertext[128];
+    bzero(ciphertext, 128);
+    int ciphertext_len = encrypt(buf, strlen(buf), key, iv, ciphertext);
+
+    if (ciphertext_len == -1) {
+        printf("encryption fail!\n");
+        return -1;
+    }
+
     pthread_mutex_lock(&listLock);
     if (msgHead == NULL) {
         struct msg *newmsg = (struct msg *) malloc(sizeof(struct msg));
 
         /* fill info for newmsg */
-        newmsg -> content = (char *) malloc((strlen(buf) + 1) * sizeof(char));
-        memcpy(newmsg -> content, buf, strlen(buf) + 1);
+        newmsg -> content = (unsigned char *) malloc(ciphertext_len * sizeof(unsigned char));
+        memcpy(newmsg -> content, ciphertext, ciphertext_len);
         newmsg -> ts = time(NULL);
         newmsg -> next = NULL;
         newmsg -> id = ids++;
+        newmsg -> len = ciphertext_len;
         pthread_rwlock_init(&newmsg -> lock, NULL);
 
         /* update head */
@@ -196,17 +209,20 @@ void add_msg (char *buf) {
         struct msg *newmsg = (struct msg *) malloc(sizeof(struct msg));
 
         /* fill info for newmsg */
-        newmsg -> content = (char *) malloc((strlen(buf) + 1) * sizeof(char));
-        memcpy(newmsg -> content, buf, strlen(buf) + 1);
+        newmsg -> content = (unsigned char *) malloc(ciphertext_len * sizeof(unsigned char));
+        memcpy(newmsg -> content, ciphertext, ciphertext_len);
         newmsg -> ts = time(NULL);
         newmsg -> next = NULL;
         newmsg -> id = ids++;
+        newmsg -> len = ciphertext_len;
         pthread_rwlock_init(&newmsg -> lock, NULL);
 
         /* update link */
         curmsg -> next = newmsg;
     }
     pthread_mutex_unlock(&listLock);
+
+    return 0;
 }
 
 int delete_msg (unsigned long msgid) {
@@ -236,16 +252,28 @@ int delete_msg (unsigned long msgid) {
     }
 }
 
-/* list all messages */
-void list_msg (int fd) {
+int list_msg (int fd) {
     pthread_mutex_lock(&listLock);
     struct msg *curmsg = msgHead;
 
     while (curmsg != NULL) {
-        writen(fd, curmsg -> content, MAX_PREVIEW_LEN);
+        unsigned char decryptedtext[128];
+        bzero(decryptedtext, 128);
+        int decryptedtext_len = decrypt(curmsg -> content, curmsg -> len, key, iv, decryptedtext);
+
+        if (decryptedtext_len == -1) {
+            printf("decryption fail!\n");
+            pthread_mutex_unlock(&listLock);
+            return -1;
+        }
+        /* Add a NULL terminator. We are expecting printable text */
+        decryptedtext[decryptedtext_len] = '\0';
+
+        writen(fd, decryptedtext, MAX_PREVIEW_LEN > strlen(decryptedtext) ? strlen(decryptedtext) : MAX_PREVIEW_LEN);
         writen(fd, "\n...\n", 5 * sizeof(char));
 
-        char msgtime[32];
+        char msgtime[40];
+        bzero(msgtime, 40);
         ctime_r(&(curmsg -> ts), msgtime);
         msgtime[strlen(msgtime) - 1] = 0;
 
@@ -262,10 +290,11 @@ void list_msg (int fd) {
     }
 
     pthread_mutex_unlock(&listLock);
+    return 0;
 }
 
 /* given an ID of a message, return its address */
-struct msg* find_msg (unsigned long msgid) {
+struct msg *find_msg (unsigned long msgid) {
     pthread_mutex_lock(&listLock);
     struct msg *curmsg = msgHead;
     while (curmsg != NULL) {
@@ -287,10 +316,23 @@ int print_msg (int fd, unsigned long msgid) {
     if (m == NULL) {
         return -1;
     }
-
     pthread_rwlock_rdlock(&m -> lock);
-    writen(fd, m -> content, strlen(m -> content));
-    char msgtime[32];
+
+    unsigned char decryptedtext[128];
+    bzero(decryptedtext, 128);
+    int decryptedtext_len = decrypt(m -> content, m -> len, key, iv, decryptedtext);
+
+    if (decryptedtext_len == -1) {
+        printf("decryption fail!\n");
+        pthread_rwlock_unlock(&m -> lock);
+        return -1;
+    }
+    /* Add a NULL terminator. We are expecting printable text */
+    decryptedtext[decryptedtext_len] = '\0';
+
+    writen(fd, decryptedtext, decryptedtext_len + 1);
+    char msgtime[40];
+    bzero(msgtime, 40);
     ctime_r(&(m -> ts), msgtime);
     msgtime[strlen(msgtime) - 1] = 0;
 
@@ -301,7 +343,7 @@ int print_msg (int fd, unsigned long msgid) {
     writen(fd, "@ ", 2 * sizeof(char));
     writen(fd, msgtime, sizeof(msgtime));
     writen(fd, "\t ID:", 5 * sizeof(char));
-    writen(fd, sid, sizeof(unsigned long));
+    writen(fd, sid, strlen(sid));
     writen(fd, "\n", sizeof(char));
     pthread_rwlock_unlock(&m -> lock);
 
@@ -353,12 +395,19 @@ void* thread_func (void *arg) {
 
         if (option == 1) {
             /* compose message */
-            char ans[MAX_MSG_LEN];
-            bzero(ans, sizeof(ans));
+            unsigned char ans[MAX_MSG_LEN];
+            bzero(ans, MAX_MSG_LEN);
             readline(connfd, ans, MAX_MSG_LEN, ']');
-            add_msg(ans);
+
+            if (add_msg(ans) != 0) {
+                char err[] = "Whoops... something went wrong! Please try again!";
+                writen(connfd, err, sizeof(err));
+            }
         } else if (option == 2) {
-            list_msg(connfd);
+            if (list_msg(connfd) == -1) {
+                char err[] = "Whoops... something went wrong! Please try again!";
+                writen(connfd, err, sizeof(err));
+            }
         } else if (option == 3) {
             unsigned long msgid = get_option(connfd);
 
@@ -377,20 +426,48 @@ void* thread_func (void *arg) {
     } while (option != 5);
 
     /* cleanup and exit */
-    pthread_detach(pthread_self());
     close(connfd);
     pthread_exit(NULL);
 }
 
-int main() {
-    /* close socket when shutting down the server */
+void print_usage() {
+    printf("Usage:\n\tcmail -p <PORT_NUMBER> -k <KEY> -i <INIT_VECTOR>\n");
+}
+
+int main(int argc, char *argv[]) {
     signal(SIGTERM, handleSig);
     signal(SIGINT, handleSig);
+
+    if (argc != 7) {
+        print_usage();
+        exit(0);
+    }
+
+    int SRV_PORT;
+    int c = 0;
+    while ( (c = getopt(argc, argv, "p:k:i:")) != -1) {
+        switch (c) {
+            case 'p':
+                SRV_PORT = atoi(optarg);
+                break;
+            case 'k':
+                key = (unsigned char *)optarg;
+                break;
+            case 'i':
+                iv = (unsigned char *)optarg;
+                break;
+            default:
+                print_usage();
+                exit(0);
+        }
+    }
+
+    printf("port: %d\nkey: %s\nIV: %s\n\n", SRV_PORT, key, iv);
 
     int *connptr;
     struct sockaddr_in servaddr, cliaddr;
     socklen_t slen = sizeof(cliaddr);
-    pthread_t tids[16];
+    pthread_t tids[64];
     pthread_mutex_init(&listLock, NULL);
 
     g_listenfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -402,7 +479,7 @@ int main() {
     bzero(&servaddr, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
     servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    servaddr.sin_port = htons(60000);
+    servaddr.sin_port = htons(SRV_PORT);
 
     if (bind(g_listenfd, (struct sockaddr*) &servaddr, sizeof(servaddr)) == -1) {
         perror("bind failed");
