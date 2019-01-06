@@ -13,7 +13,7 @@ $ ./cmail
 ```
 
 ## TODOs
-[ ] IPv6 support
-[ ] Custom server port and key/IV through command line arguments
-[ ] Client program to support safe exchange of cryptographic keys
-[ ] Message sorting by IPs
+- [ ] IPv6 support
+- [ ] Custom server port and key/IV through command line arguments
+- [ ] Client program to support safe exchange of cryptographic keys
+- [ ] Message sorting by IPs
