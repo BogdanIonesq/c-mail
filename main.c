@@ -231,6 +231,7 @@ int delete_msg (unsigned long msgid) {
 
     if (cur -> id == msgid) {
         msgHead = cur -> next;
+        pthread_rwlock_destroy(&cur -> lock);
         free(cur);
         pthread_mutex_unlock(&listLock);
         return 0;
@@ -246,6 +247,7 @@ int delete_msg (unsigned long msgid) {
     } else {
         struct msg *aux = cur -> next;
         cur -> next = cur -> next -> next;
+        pthread_rwlock_destroy(&aux -> lock);
         free(aux);
         pthread_mutex_unlock(&listLock);
         return 0;
