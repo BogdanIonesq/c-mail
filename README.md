@@ -41,6 +41,7 @@ Encryption was done with the help of the [OpenSSL](https://github.com/openssl/op
 In a perfect world, the key should be 256 bit and the IV 128 bit and they probably should be safely generated and exchanged with each client when connecting, definitely not stored as plaintext on the server, due to obvious security reasons. Nevertheless, the current approach works fine for educational purposes, but the aforementioned improvement should be implemented in the future (if time permits).
 
 ## TODOs
+- [ ] Thread pool
 - [ ] IPv6 support
 - [X] Custom server port and key/IV through command line arguments
 - [ ] Client program to support safe exchange of cryptographic keys
