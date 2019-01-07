@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <semaphore.h>
 #include <openssl/conf.h>
 #include <openssl/evp.h>
 #include <openssl/err.h>
@@ -16,6 +17,7 @@
 /* Constants */
 #define MAX_MSG_LEN 64      /* maximum length of a message */
 #define MAX_PREVIEW_LEN 16  /* maximum length of a message when listing */
+#define MAX_THREADS 64      /* thread pool size */
 
 /* Message structure */
 struct msg {
@@ -34,12 +36,48 @@ struct msg *msgHead = NULL; /* head to the list of messages */
 pthread_mutex_t listLock;   /* message list mutex */
 unsigned char *key;         /* A 256 bit key (used for encryption) */
 unsigned char *iv;          /* A 128 bit IV (used for encryption) */
+sem_t threads_sem;          /* thread pool semaphore */
+int connq[MAX_THREADS];     /* threads will obtain the file descriptors from this queue */
+int connq_top = -1;         /* queue top */
+pthread_mutex_t connq_lock; /* operations from the queue must be guarded (thread-safe) */
+
+/* push a socket into the connections queue */
+int push_conn (int fd) {
+    if (connq_top == MAX_THREADS - 1) {
+        return -1;
+    }
+    connq[++connq_top] = fd;
+    return 0;
+}
+
+/* pop a socket from the connections queue */
+int pop_conn () {
+    if (connq_top == -1) {
+        return -1;
+    }
+    connq_top--;
+    return connq[connq_top + 1];
+}
 
 /* cleanup function in case of shutting down the server */
 void handleSig (int sig) {
     printf("\nshutting down server...\n");
+
+    /* close the listening socket */
     close(g_listenfd);
+
+    /* kill the thread pool */
+    int i;
+    for (i = 0; i < MAX_THREADS; i++) {
+        push_conn(1);
+        sem_post(&threads_sem);
+    }
+
+    /* destroy mutexes and sempahores*/
     pthread_mutex_destroy(&listLock);
+    pthread_mutex_destroy(&connq_lock);
+    sem_destroy(&threads_sem);
+
     exit(0);
 }
 
@@ -286,7 +324,7 @@ int list_msg (int fd) {
         writen(fd, msgtime, sizeof(msgtime));
         writen(fd, "\t ID:", 5 * sizeof(char));
         writen(fd, sid, sizeof(int));
-        writen(fd, "\n", sizeof(char));
+        writen(fd, "\n\n", 2 * sizeof(char));
 
         curmsg = curmsg -> next;
     }
@@ -332,6 +370,7 @@ int print_msg (int fd, unsigned long msgid) {
     /* Add a NULL terminator. We are expecting printable text */
     decryptedtext[decryptedtext_len] = '\0';
 
+    writen(fd, "\n", sizeof(char));
     writen(fd, decryptedtext, decryptedtext_len + 1);
     char msgtime[40];
     bzero(msgtime, 40);
@@ -346,7 +385,7 @@ int print_msg (int fd, unsigned long msgid) {
     writen(fd, msgtime, sizeof(msgtime));
     writen(fd, "\t ID:", 5 * sizeof(char));
     writen(fd, sid, strlen(sid));
-    writen(fd, "\n", sizeof(char));
+    writen(fd, "\n\n", 2 * sizeof(char));
     pthread_rwlock_unlock(&m -> lock);
 
     return 0;
@@ -383,53 +422,69 @@ unsigned long get_option (int fd) {
 
 /* main function for each thread */
 void* thread_func (void *arg) {
-    int connfd = *((int *) arg);
-    free(arg);
+    while (1) {
+        /* wait for a connection */
+        sem_wait(&threads_sem);
 
-    unsigned long option = 0;
-    do {
-        if (print_options(connfd) != 0) {
-            printf("print_options() failure!\n");
+        /* obtain the socket fd from the connections queue */
+        pthread_mutex_lock(&connq_lock);
+        int connfd = pop_conn();
+        pthread_mutex_unlock(&connq_lock);
+
+        if (connfd == -1) {
+            /* pop_conn() returned an error */
+            printf("No connection fd available!\n");
             continue;
+        } else if (connfd == 1) {
+            /* in case of shutting down the server, kill all threads */
+            pthread_exit(NULL);
         }
 
-        option = get_option(connfd);
-
-        if (option == 1) {
-            /* compose message */
-            unsigned char ans[MAX_MSG_LEN];
-            bzero(ans, MAX_MSG_LEN);
-            readline(connfd, ans, MAX_MSG_LEN, ']');
-
-            if (add_msg(ans) != 0) {
-                char err[] = "Whoops... something went wrong! Please try again!";
-                writen(connfd, err, sizeof(err));
+        /* main loop */
+        unsigned long option = 0;
+        do {
+            if (print_options(connfd) != 0) {
+                printf("print_options() failure!\n");
+                continue;
             }
-        } else if (option == 2) {
-            if (list_msg(connfd) == -1) {
-                char err[] = "Whoops... something went wrong! Please try again!";
-                writen(connfd, err, sizeof(err));
-            }
-        } else if (option == 3) {
-            unsigned long msgid = get_option(connfd);
 
-            if (print_msg(connfd, msgid) != 0) {
-                char err[] = "Incorrect message ID! Use [2] to list messages.\n";
-                writen(connfd, err, sizeof(err));
-            }
-        } else if (option == 4) {
-            unsigned long msgid = get_option(connfd);
+            option = get_option(connfd);
 
-            if (delete_msg(msgid) != 0) {
-                char err[] = "Incorrect message ID! Use [2] to list messages.\n";
-                writen(connfd, err, sizeof(err));
-            }
-        }
-    } while (option != 5);
+            if (option == 1) {
+                /* compose message */
+                unsigned char ans[MAX_MSG_LEN];
+                bzero(ans, MAX_MSG_LEN);
+                readline(connfd, ans, MAX_MSG_LEN, ']');
 
-    /* cleanup and exit */
-    close(connfd);
-    pthread_exit(NULL);
+                if (add_msg(ans) != 0) {
+                    char err[] = "Whoops... something went wrong! Please try again!";
+                    writen(connfd, err, sizeof(err));
+                }
+            } else if (option == 2) {
+                if (list_msg(connfd) == -1) {
+                    char err[] = "Whoops... something went wrong! Please try again!";
+                    writen(connfd, err, sizeof(err));
+                }
+            } else if (option == 3) {
+                unsigned long msgid = get_option(connfd);
+
+                if (print_msg(connfd, msgid) != 0) {
+                    char err[] = "Incorrect message ID! Use [2] to list messages.\n";
+                    writen(connfd, err, sizeof(err));
+                }
+            } else if (option == 4) {
+                unsigned long msgid = get_option(connfd);
+
+                if (delete_msg(msgid) != 0) {
+                    char err[] = "Incorrect message ID! Use [2] to list messages.\n";
+                    writen(connfd, err, sizeof(err));
+                }
+            }
+        } while (option != 5);
+
+        /* cleanup */
+        close(connfd);
+    }
 }
 
 void print_usage() {
@@ -437,9 +492,7 @@ void print_usage() {
 }
 
 int main(int argc, char *argv[]) {
-    signal(SIGTERM, handleSig);
-    signal(SIGINT, handleSig);
-
+    /* parse command line arguments */
     if (argc != 7) {
         print_usage();
         exit(0);
@@ -463,13 +516,28 @@ int main(int argc, char *argv[]) {
                 exit(0);
         }
     }
-
     printf("port: %d\nkey: %s\nIV: %s\n\n", SRV_PORT, key, iv);
 
-    int *connptr;
+    /* shut down gracefully */
+    signal(SIGTERM, handleSig);
+    signal(SIGINT, handleSig);
+
+    /* create the thread pool */
+    pthread_t tids[MAX_THREADS];
+    sem_init(&threads_sem, 0, 0);
+    pthread_mutex_init(&connq_lock, NULL);
+
+    int i;
+    for (i = 0; i < MAX_THREADS; i++) {
+        if (pthread_create(&tids[i], NULL, &thread_func, NULL) != 0) {
+            perror("creating thread failure");
+            exit(0);
+        }
+    }
+
+    /* start the listening socket */
     struct sockaddr_in servaddr, cliaddr;
     socklen_t slen = sizeof(cliaddr);
-    pthread_t tids[64];
     pthread_mutex_init(&listLock, NULL);
 
     g_listenfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -495,18 +563,17 @@ int main(int argc, char *argv[]) {
         exit(0);
     }
 
-    printf("Listening...\n");
-    int i = 0;
+    printf("Server is listening...\n\n");
 
     for ( ; ; ) {
-        connptr = (int *) malloc (sizeof(int));
-        *connptr = accept(g_listenfd, (struct sockaddr *) &cliaddr, &slen);
+        int newconn = accept(g_listenfd, (struct sockaddr *) &cliaddr, &slen);
 
         printf("connection from %s, port %d\n", inet_ntoa(cliaddr.sin_addr), ntohs(cliaddr.sin_port));
 
-        if (pthread_create(&tids[i++], NULL, &thread_func, connptr) != 0) {
-            perror("creating thread failure");
-            close(*connptr);
+        if (push_conn(newconn) != 0) {
+            printf("No thread available!\n");
+        } else {
+            sem_post(&threads_sem);
         }
     }
 }
